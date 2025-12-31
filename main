@@ -413,7 +413,7 @@ function getOrCreateDebugLogSheet_(ss) {
   let s = ss.getSheetByName(DEBUG_LOG_SHEET_NAME);
   if (!s) {
     s = ss.insertSheet(DEBUG_LOG_SHEET_NAME);
-    s.getRange(1, 1, 1, 9).setValues([[
+    s.getRange(1, 1, 1, 10).setValues([[
       "timestamp",
       "row",
       "first_cell",
