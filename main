@@ -6,11 +6,13 @@ const START_ROW = 2;                // assumes row 1 is headers
 const COL_FIRST = 1;                // A
 const COL_LAST  = 2;                // B
 
-// Output columns (G:J)
+// Output columns (G:L)
 const COL_ADDR  = 7;                // G
 const COL_CITY  = 8;                // H
 const COL_STATE = 9;                // I
 const COL_ZIP   = 10;               // J
+const COL_EMPLOYER = 11;            // K
+const COL_OCCUPATION = 12;          // L
 
 // Fixed output values
 const FIXED_CITY_VALUE = "Lexington";
@@ -26,7 +28,7 @@ const SLEEP_MS = 150;
 const DEBUG_LOG_SHEET_NAME = "KREF_Debug_Log";
 const DEBUG_TOAST_EVERY_N_ROWS = 1;     // toast every row
 const DEBUG_WRITE_LOG_EVERY_ROW = true; // always log each row
-const DEBUG_INTERACTIVE_STEP = true;    // shows an OK dialog periodically
+const DEBUG_INTERACTIVE_STEP = false;   // shows an OK dialog periodically
 const DEBUG_INTERACTIVE_EVERY_N_ROWS = 1; // set to 1 for every row, or 10 for less annoying
 const DEBUG_INTERACTIVE_MAX_STOPS = 50; // safety so you do not have to click 400 times by accident
 
@@ -34,7 +36,7 @@ const DEBUG_INTERACTIVE_MAX_STOPS = 50; // safety so you do not have to click 40
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("KREF Tools")
-    .addItem("Fill addresses (A,B -> G:J) with debug", "fillAddressesFromKref")
+    .addItem("Fill addresses (A,B -> G:L) with debug", "fillAddressesFromKref")
     .addItem("Clear debug log sheet", "clearKrefDebugLog")
     .addToUi();
 }
@@ -75,6 +77,8 @@ function fillAddressesFromKref() {
         found: "SKIP",
         address: "",
         zip: "",
+        employer: "",
+        occupation: "",
         note: "Skipped: last name cell has no letters (not a name)"
       });
       maybeToast_(r, `Row ${r}: SKIP (last has no letters) | First="${firstRaw}" Last="${lastRaw}"`);
@@ -97,6 +101,8 @@ function fillAddressesFromKref() {
         found: "SKIP",
         address: existingAddr,
         zip: existingZip,
+        employer: "",
+        occupation: "",
         note: "Skipped: already filled (G and J)"
       });
       maybeToast_(r, `Row ${r}: SKIP (already filled) | ${firstRaw} ${lastRaw}`);
@@ -114,6 +120,8 @@ function fillAddressesFromKref() {
         found: "SKIP",
         address: "",
         zip: "",
+        employer: "",
+        occupation: "",
         note: "Skipped: firstQuery empty after cleanup"
       });
       maybeToast_(r, `Row ${r}: SKIP (bad first) | First="${firstRaw}" Last="${lastRaw}"`);
@@ -154,6 +162,8 @@ function fillAddressesFromKref() {
       sheet.getRange(r, COL_CITY).setValue(FIXED_CITY_VALUE);
       sheet.getRange(r, COL_STATE).setValue(FIXED_STATE_VALUE);
       sheet.getRange(r, COL_ZIP).setValue(result.match.zip || "");
+      sheet.getRange(r, COL_EMPLOYER).setValue(result.match.employer || "");
+      sheet.getRange(r, COL_OCCUPATION).setValue(result.match.occupation || "");
 
       writeDebugLogRow_(logSheet, {
         row: r,
@@ -164,6 +174,8 @@ function fillAddressesFromKref() {
         found: "FOUND",
         address: result.match.address || "",
         zip: result.match.zip || "",
+        employer: result.match.employer || "",
+        occupation: result.match.occupation || "",
         note: result.debug ? result.debug.note : ""
       });
 
@@ -179,6 +191,8 @@ function fillAddressesFromKref() {
         found: "NOT FOUND",
         address: "",
         zip: "",
+        employer: "",
+        occupation: "",
         note: result && result.debug ? result.debug.note : "No match returned"
       });
 
@@ -282,7 +296,9 @@ function fetchFirstMatchFromKrefCsv_(url, firstRaw, lastRaw) {
       first: findHeaderIndex_(header, ["contributor first name", "first name", "firstname", "fname"]),
       last:  findHeaderIndex_(header, ["contributor last name", "last name", "lastname", "lname"]),
       addr:  findHeaderIndex_(header, ["address 1", "address", "street", "street address", "address line 1", "address1"]),
-      zip:   findHeaderIndex_(header, ["zip", "zip code", "zipcode", "postal code"])
+      zip:   findHeaderIndex_(header, ["zip", "zip code", "zipcode", "postal code"]),
+      employer: findHeaderIndex_(header, ["employer", "employer name"]),
+      occupation: findHeaderIndex_(header, ["occupation", "job", "job title"])
     };
 
     const headerInfo =
@@ -318,12 +334,14 @@ function fetchFirstMatchFromKrefCsv_(url, firstRaw, lastRaw) {
 
       const address = idx.addr !== -1 ? (row[idx.addr] || "").toString().trim() : "";
       const zip = idx.zip !== -1 ? (row[idx.zip] || "").toString().trim() : "";
+      const employer = idx.employer !== -1 ? (row[idx.employer] || "").toString().trim() : "";
+      const occupation = idx.occupation !== -1 ? (row[idx.occupation] || "").toString().trim() : "";
 
       if (!address && !zip) continue;
 
       return {
         httpCode,
-        match: { address, zip },
+        match: { address, zip, employer, occupation },
         debug: {
           note: `Matched CSV row ${r + 1}`,
           preview,
@@ -413,7 +431,7 @@ function getOrCreateDebugLogSheet_(ss) {
   let s = ss.getSheetByName(DEBUG_LOG_SHEET_NAME);
   if (!s) {
     s = ss.insertSheet(DEBUG_LOG_SHEET_NAME);
-    s.getRange(1, 1, 1, 10).setValues([[
+    s.getRange(1, 1, 1, 12).setValues([[
       "timestamp",
       "row",
       "first_cell",
@@ -423,13 +441,15 @@ function getOrCreateDebugLogSheet_(ss) {
       "status",
       "address",
       "zip",
+      "employer",
+      "occupation",
       "note"
     ]]);
   }
   return s;
 }
 
-function writeDebugLogRow_(logSheet, { row, first, last, url, httpCode, found, address, zip, note }) {
+function writeDebugLogRow_(logSheet, { row, first, last, url, httpCode, found, address, zip, employer, occupation, note }) {
   if (!DEBUG_WRITE_LOG_EVERY_ROW) return;
   logSheet.appendRow([
     new Date(),
@@ -441,6 +461,8 @@ function writeDebugLogRow_(logSheet, { row, first, last, url, httpCode, found, a
     found || "",
     address || "",
     zip || "",
+    employer || "",
+    occupation || "",
     note || ""
   ]);
 }
@@ -450,7 +472,7 @@ function clearKrefDebugLog() {
   const s = ss.getSheetByName(DEBUG_LOG_SHEET_NAME);
   if (!s) return;
   s.clear();
-  s.getRange(1, 1, 1, 10).setValues([[
+  s.getRange(1, 1, 1, 12).setValues([[
     "timestamp",
     "row",
     "first_cell",
@@ -460,6 +482,8 @@ function clearKrefDebugLog() {
     "status",
     "address",
     "zip",
+    "employer",
+    "occupation",
     "note"
   ]]);
   SpreadsheetApp.getActive().toast("Cleared KREF_Debug_Log", "KREF Tools", 4);
