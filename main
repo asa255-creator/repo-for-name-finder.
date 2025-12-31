@@ -1,0 +1,466 @@
+/** ========================== CONFIG ========================== **/
+const SOURCE_SHEET_NAME = "CDID";   // change if your working sheet name is different
+const START_ROW = 2;                // assumes row 1 is headers
+
+// Input columns (A,B)
+const COL_FIRST = 1;                // A
+const COL_LAST  = 2;                // B
+
+// Output columns (G:J)
+const COL_ADDR  = 7;                // G
+const COL_CITY  = 8;                // H
+const COL_STATE = 9;                // I
+const COL_ZIP   = 10;               // J
+
+// Fixed output values
+const FIXED_CITY_VALUE = "Lexington";
+const FIXED_STATE_VALUE = "KY";
+
+// KREF query city parameter (what you asked for)
+const KREF_CITY_PARAM = "lex";      // IMPORTANT: this is the query city in the URL
+
+// Throttle
+const SLEEP_MS = 150;
+
+// Debug + progress
+const DEBUG_LOG_SHEET_NAME = "KREF_Debug_Log";
+const DEBUG_TOAST_EVERY_N_ROWS = 1;     // toast every row
+const DEBUG_WRITE_LOG_EVERY_ROW = true; // always log each row
+const DEBUG_INTERACTIVE_STEP = true;    // shows an OK dialog periodically
+const DEBUG_INTERACTIVE_EVERY_N_ROWS = 1; // set to 1 for every row, or 10 for less annoying
+const DEBUG_INTERACTIVE_MAX_STOPS = 50; // safety so you do not have to click 400 times by accident
+
+/** ========================== MENU ========================== **/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("KREF Tools")
+    .addItem("Fill addresses (A,B -> G:J) with debug", "fillAddressesFromKref")
+    .addItem("Clear debug log sheet", "clearKrefDebugLog")
+    .addToUi();
+}
+
+/** ========================== MAIN ========================== **/
+function fillAddressesFromKref() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SOURCE_SHEET_NAME) || ss.getActiveSheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // Only base last row on A:B (this avoids random junk elsewhere extending getLastRow)
+  const lastDataRow = findLastDataRowByColumns_(sheet, START_ROW, [COL_FIRST, COL_LAST]);
+  if (lastDataRow < START_ROW) {
+    SpreadsheetApp.getActive().toast("No data found in A:B below header row.", "KREF Tools", 5);
+    return;
+  }
+
+  const logSheet = getOrCreateDebugLogSheet_(ss);
+
+  let interactiveStops = 0;
+
+  for (let r = START_ROW; r <= lastDataRow; r++) {
+    const firstRaw = (sheet.getRange(r, COL_FIRST).getValue() || "").toString().trim();
+    const lastRaw  = (sheet.getRange(r, COL_LAST).getValue()  || "").toString().trim();
+
+    // Skip fully blank
+    if (!firstRaw && !lastRaw) continue;
+
+    // Skip if "last name" is not plausibly a last name (your screenshot case)
+    // This rejects numeric IDs and strings with no letters.
+    if (!hasAnyLetters_(lastRaw)) {
+      writeDebugLogRow_(logSheet, {
+        row: r,
+        first: firstRaw,
+        last: lastRaw,
+        url: "",
+        httpCode: "",
+        found: "SKIP",
+        address: "",
+        zip: "",
+        note: "Skipped: last name cell has no letters (not a name)"
+      });
+      maybeToast_(r, `Row ${r}: SKIP (last has no letters) | First="${firstRaw}" Last="${lastRaw}"`);
+      continue;
+    }
+
+    // Require last name (per your rules)
+    if (!lastRaw) continue;
+
+    // Skip already filled rows (if G has something AND J has something)
+    const existingAddr = (sheet.getRange(r, COL_ADDR).getValue() || "").toString().trim();
+    const existingZip  = (sheet.getRange(r, COL_ZIP).getValue()  || "").toString().trim();
+    if (existingAddr && existingZip) {
+      writeDebugLogRow_(logSheet, {
+        row: r,
+        first: firstRaw,
+        last: lastRaw,
+        url: "",
+        httpCode: "",
+        found: "SKIP",
+        address: existingAddr,
+        zip: existingZip,
+        note: "Skipped: already filled (G and J)"
+      });
+      maybeToast_(r, `Row ${r}: SKIP (already filled) | ${firstRaw} ${lastRaw}`);
+      continue;
+    }
+
+    const firstQuery = makeFirstNameQuery(firstRaw); // first 3 letters
+    if (!firstQuery) {
+      writeDebugLogRow_(logSheet, {
+        row: r,
+        first: firstRaw,
+        last: lastRaw,
+        url: "",
+        httpCode: "",
+        found: "SKIP",
+        address: "",
+        zip: "",
+        note: "Skipped: firstQuery empty after cleanup"
+      });
+      maybeToast_(r, `Row ${r}: SKIP (bad first) | First="${firstRaw}" Last="${lastRaw}"`);
+      continue;
+    }
+
+    const url = buildKrefExportUrl_({
+      city: KREF_CITY_PARAM,
+      firstName: firstQuery,
+      lastName: lastRaw
+    });
+
+    // Fetch and parse
+    const result = fetchFirstMatchFromKrefCsv_(url, firstRaw, lastRaw);
+
+    // Step-by-step interactive prompt (so you can read what is happening)
+    if (DEBUG_INTERACTIVE_STEP && (r - START_ROW) % DEBUG_INTERACTIVE_EVERY_N_ROWS === 0 && interactiveStops < DEBUG_INTERACTIVE_MAX_STOPS) {
+      interactiveStops++;
+      const preview = (result && result.debug && result.debug.preview) ? result.debug.preview : "";
+      const hdrInfo = (result && result.debug && result.debug.headerInfo) ? result.debug.headerInfo : "";
+      ui.alert(
+        "KREF step-by-step",
+        `Row ${r}\n` +
+        `First cell: ${firstRaw}\n` +
+        `Last cell: ${lastRaw}\n` +
+        `FirstQuery: ${firstQuery}\n\n` +
+        `URL:\n${url}\n\n` +
+        `HTTP: ${(result && result.httpCode) ? result.httpCode : ""}\n\n` +
+        `Header parse:\n${hdrInfo}\n\n` +
+        `Response preview:\n${preview}`,
+        ui.ButtonSet.OK
+      );
+    }
+
+    if (result && result.match) {
+      // Write outputs immediately (line by line)
+      sheet.getRange(r, COL_ADDR).setValue(result.match.address || "");
+      sheet.getRange(r, COL_CITY).setValue(FIXED_CITY_VALUE);
+      sheet.getRange(r, COL_STATE).setValue(FIXED_STATE_VALUE);
+      sheet.getRange(r, COL_ZIP).setValue(result.match.zip || "");
+
+      writeDebugLogRow_(logSheet, {
+        row: r,
+        first: firstRaw,
+        last: lastRaw,
+        url: url,
+        httpCode: result.httpCode,
+        found: "FOUND",
+        address: result.match.address || "",
+        zip: result.match.zip || "",
+        note: result.debug ? result.debug.note : ""
+      });
+
+      maybeToast_(r, `Row ${r}: FOUND | ${firstRaw} ${lastRaw} | ${result.match.address || ""} ${result.match.zip || ""}`);
+    } else {
+      // Leave blank if not found, but still log
+      writeDebugLogRow_(logSheet, {
+        row: r,
+        first: firstRaw,
+        last: lastRaw,
+        url: url,
+        httpCode: result ? result.httpCode : "",
+        found: "NOT FOUND",
+        address: "",
+        zip: "",
+        note: result && result.debug ? result.debug.note : "No match returned"
+      });
+
+      maybeToast_(r, `Row ${r}: NOT FOUND | ${firstRaw} ${lastRaw} | URL City=${KREF_CITY_PARAM}, First=${firstQuery}, Last=${lastRaw}`);
+    }
+
+    Utilities.sleep(SLEEP_MS);
+  }
+
+  SpreadsheetApp.getActive().toast("Done. See KREF_Debug_Log for details.", "KREF Tools", 8);
+}
+
+/** ========================== NAME LOGIC ========================== **/
+function makeFirstNameQuery(firstRaw) {
+  let use = firstRaw;
+
+  // If first name has "&", use the part after "&"
+  if (firstRaw.includes("&")) {
+    const parts = firstRaw.split("&").map(p => p.trim()).filter(Boolean);
+    if (parts.length >= 2) use = parts[1];
+  }
+
+  // Strip to letters only
+  use = use.replace(/[^a-zA-Z]/g, "").trim();
+  if (!use) return "";
+
+  // First 3 letters, lowercased
+  return use.substring(0, 3).toLowerCase();
+}
+
+/** ========================== URL BUILDING ========================== **/
+function buildKrefExportUrl_({ city, firstName, lastName }) {
+  const base = "https://secure.kentucky.gov/kref/publicsearch/ExportContributors";
+  const params = {
+    City: city, // this will be "lex"
+    ElectionDate: "01/01/0001 00:00:00",
+    FirstName: firstName,
+    LastName: lastName,
+    ContributionSearchType: "All"
+  };
+
+  const qs = Object.keys(params)
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
+    .join("&");
+
+  return `${base}?${qs}`;
+}
+
+/** ========================== FETCH + PARSE ========================== **/
+function fetchFirstMatchFromKrefCsv_(url, firstRaw, lastRaw) {
+  let httpCode = "";
+  try {
+    const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+    httpCode = resp.getResponseCode();
+    const text = resp.getContentText() || "";
+
+    // Preview first few lines for debugging
+    const preview = text.split(/\r?\n/).slice(0, 6).join("\n").substring(0, 1200);
+
+    if (httpCode !== 200) {
+      return {
+        httpCode,
+        match: null,
+        debug: {
+          note: `HTTP ${httpCode}`,
+          preview,
+          headerInfo: ""
+        }
+      };
+    }
+
+    // KREF sometimes returns HTML when something goes wrong
+    if (text.trim().startsWith("<")) {
+      return {
+        httpCode,
+        match: null,
+        debug: {
+          note: "Non-CSV response (starts with '<')",
+          preview,
+          headerInfo: ""
+        }
+      };
+    }
+
+    const rows = Utilities.parseCsv(text);
+    if (!rows || rows.length < 2) {
+      return {
+        httpCode,
+        match: null,
+        debug: {
+          note: "CSV parsed but no data rows",
+          preview,
+          headerInfo: ""
+        }
+      };
+    }
+
+    const header = rows[0].map(h => (h || "").toString().trim().toLowerCase());
+
+    const idx = {
+      first: findHeaderIndex_(header, ["contributor first name", "first name", "firstname", "fname"]),
+      last:  findHeaderIndex_(header, ["contributor last name", "last name", "lastname", "lname"]),
+      addr:  findHeaderIndex_(header, ["address 1", "address", "street", "street address", "address line 1", "address1"]),
+      zip:   findHeaderIndex_(header, ["zip", "zip code", "zipcode", "postal code"])
+    };
+
+    const headerInfo =
+      `first idx=${idx.first}, last idx=${idx.last}, addr idx=${idx.addr}, zip idx=${idx.zip}\n` +
+      `header[addr]=${idx.addr !== -1 ? header[idx.addr] : "(missing)"}\n` +
+      `header[zip]=${idx.zip !== -1 ? header[idx.zip] : "(missing)"}`;
+
+    if (idx.addr === -1 && idx.zip === -1) {
+      return {
+        httpCode,
+        match: null,
+        debug: {
+          note: "Could not find Address/Zip headers in CSV",
+          preview,
+          headerInfo
+        }
+      };
+    }
+
+    const firstNorm = normalizeName_(firstRaw);
+    const lastNorm  = normalizeName_(lastRaw);
+    const first3 = firstNorm.substring(0, 3);
+
+    // Best-effort match: last startswith lastNorm, first startswith first3
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+
+      const csvFirst = idx.first !== -1 ? normalizeName_(row[idx.first]) : "";
+      const csvLast  = idx.last  !== -1 ? normalizeName_(row[idx.last])  : "";
+
+      if (csvLast && lastNorm && !csvLast.startsWith(lastNorm)) continue;
+      if (csvFirst && first3 && !csvFirst.startsWith(first3)) continue;
+
+      const address = idx.addr !== -1 ? (row[idx.addr] || "").toString().trim() : "";
+      const zip = idx.zip !== -1 ? (row[idx.zip] || "").toString().trim() : "";
+
+      if (!address && !zip) continue;
+
+      return {
+        httpCode,
+        match: { address, zip },
+        debug: {
+          note: `Matched CSV row ${r + 1}`,
+          preview,
+          headerInfo
+        }
+      };
+    }
+
+    return {
+      httpCode,
+      match: null,
+      debug: {
+        note: "CSV returned rows but none matched first3 + last",
+        preview,
+        headerInfo
+      }
+    };
+
+  } catch (e) {
+    return {
+      httpCode,
+      match: null,
+      debug: {
+        note: `Exception: ${e}`,
+        preview: "",
+        headerInfo: ""
+      }
+    };
+  }
+}
+
+function findHeaderIndex_(headerRow, candidates) {
+  for (const c of candidates) {
+    const i = headerRow.indexOf(c);
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+function normalizeName_(v) {
+  return (v || "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+}
+
+function hasAnyLetters_(s) {
+  return /[A-Za-z]/.test((s || "").toString());
+}
+
+/** ========================== LAST ROW FIX ========================== **/
+function findLastDataRowByColumns_(sheet, startRow, colNums) {
+  // Determine the last row that has any content in the specified columns.
+  // This prevents getLastRow from being inflated by unrelated data elsewhere.
+  const maxRows = sheet.getLastRow();
+  if (maxRows < startRow) return startRow - 1;
+
+  const numRows = maxRows - startRow + 1;
+  const range = sheet.getRange(startRow, Math.min.apply(null, colNums), numRows, (Math.max.apply(null, colNums) - Math.min.apply(null, colNums) + 1));
+  const values = range.getValues();
+
+  // Map original sheet columns to indices in values
+  const minCol = Math.min.apply(null, colNums);
+  const wantedIdx = colNums.map(c => c - minCol);
+
+  for (let i = values.length - 1; i >= 0; i--) {
+    const row = values[i];
+    let any = false;
+    for (const idx of wantedIdx) {
+      const v = (row[idx] || "").toString().trim();
+      if (v) { any = true; break; }
+    }
+    if (any) return startRow + i;
+  }
+  return startRow - 1;
+}
+
+/** ========================== PROGRESS + LOG ========================== **/
+function maybeToast_(rowNum, msg) {
+  if (DEBUG_TOAST_EVERY_N_ROWS <= 0) return;
+  if ((rowNum - START_ROW) % DEBUG_TOAST_EVERY_N_ROWS !== 0) return;
+  SpreadsheetApp.getActive().toast(msg, "KREF Tools", 5);
+}
+
+function getOrCreateDebugLogSheet_(ss) {
+  let s = ss.getSheetByName(DEBUG_LOG_SHEET_NAME);
+  if (!s) {
+    s = ss.insertSheet(DEBUG_LOG_SHEET_NAME);
+    s.getRange(1, 1, 1, 9).setValues([[
+      "timestamp",
+      "row",
+      "first_cell",
+      "last_cell",
+      "url",
+      "http_code",
+      "status",
+      "address",
+      "zip",
+      "note"
+    ]]);
+  }
+  return s;
+}
+
+function writeDebugLogRow_(logSheet, { row, first, last, url, httpCode, found, address, zip, note }) {
+  if (!DEBUG_WRITE_LOG_EVERY_ROW) return;
+  logSheet.appendRow([
+    new Date(),
+    row,
+    first || "",
+    last || "",
+    url || "",
+    httpCode || "",
+    found || "",
+    address || "",
+    zip || "",
+    note || ""
+  ]);
+}
+
+function clearKrefDebugLog() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const s = ss.getSheetByName(DEBUG_LOG_SHEET_NAME);
+  if (!s) return;
+  s.clear();
+  s.getRange(1, 1, 1, 10).setValues([[
+    "timestamp",
+    "row",
+    "first_cell",
+    "last_cell",
+    "url",
+    "http_code",
+    "status",
+    "address",
+    "zip",
+    "note"
+  ]]);
+  SpreadsheetApp.getActive().toast("Cleared KREF_Debug_Log", "KREF Tools", 4);
+}
